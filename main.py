@@ -20,7 +20,7 @@ app.add_middleware(
 # ✅ END CORS BLOCK
 
 SMM_API_URL = "https://cheapestsmmpanels.com/api/v2"
-ALLOWED_SERVICES = [234]
+ALLOWED_SERVICES = [234,1348]
 
 class Order(BaseModel):
     order_id: str
