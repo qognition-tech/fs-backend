@@ -1,58 +1,99 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, EmailStr
 import httpx
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# ✅ ADD THIS BLOCK
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://followerspike.lovable.app",  # production frontend
-        "http://localhost:8080",              # local dev (optional)
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# ✅ END CORS BLOCK
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-SMM_API_URL = "https://cheapestsmmpanels.com/api/v2"
-ALLOWED_SERVICES = [234,1348]
+HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json"
+}
 
-class Order(BaseModel):
-    order_id: str
-    service_id: int
-    link: str
+client = httpx.AsyncClient()
+
+# ---------------------------
+# MODELS
+# ---------------------------
+class PaidOrderPayload(BaseModel):
+    email: EmailStr
+    service_id: str
+    target_url: str
     quantity: int
-    runs: int | None = None
-    interval: int | None = None
+    amount: float  # total paid amount (validated by DB trigger)
 
-@app.post("/create-order")
-async def create_order(order: Order):
-    if order.service_id not in ALLOWED_SERVICES:
-        raise HTTPException(status_code=403, detail="Service not allowed")
+# ---------------------------
+# HELPERS
+# ---------------------------
+async def get_or_create_customer(email: str) -> str:
+    # Try fetch existing customer
+    r = await client.get(
+        f"{SUPABASE_URL}/rest/v1/customers?email=eq.{email}&select=id",
+        headers=HEADERS
+    )
 
-    payload = {
-        "key": os.environ.get("SMM_API_KEY"),
-        "action": "add",
-        "service": str(order.service_id),
-        "link": order.link,
-        "quantity": str(order.quantity),
+    if r.status_code != 200:
+        raise HTTPException(500, "Customer lookup failed")
+
+    data = r.json()
+    if data:
+        return data[0]["id"]
+
+    # Insert new customer
+    r = await client.post(
+        f"{SUPABASE_URL}/rest/v1/customers",
+        headers=HEADERS,
+        json={"email": email}
+    )
+
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, "Customer creation failed")
+
+    return r.json()[0]["id"]
+
+# ---------------------------
+# PAYMENT WEBHOOK (ENTRY POINT)
+# ---------------------------
+@app.post("/webhook/payment-success")
+async def payment_success(payload: PaidOrderPayload):
+    """
+    This endpoint MUST be called only after payment is confirmed.
+    Example: Stripe / Razorpay webhook
+    """
+
+    # 1️⃣ Get or create customer
+    customer_id = await get_or_create_customer(payload.email)
+
+    # 2️⃣ Create order (DB triggers validate quantity + amount)
+    order_data = {
+        "customer_id": customer_id,
+        "service_id": payload.service_id,
+        "target_url": payload.target_url,
+        "quantity": payload.quantity,
+        "amount": payload.amount,
+        "status": "paid"
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(SMM_API_URL, data=payload)
-        supplier = resp.json()
+    r = await client.post(
+        f"{SUPABASE_URL}/rest/v1/orders",
+        headers=HEADERS,
+        json=order_data
+    )
 
-    if resp.status_code != 200 or "error" in supplier:
-        raise HTTPException(status_code=502, detail=supplier)
+    if r.status_code not in (200, 201):
+        raise HTTPException(400, f"Order creation failed: {r.text}")
+
+    order = r.json()[0]
 
     return {
-        "status": "success",
-        "local_order_id": order.order_id,
-        "supplier_order_id": supplier.get("order"),
-        "raw_supplier_response": supplier,
+        "success": True,
+        "order_id": order["id"],
+        "status": order["status"]
     }
