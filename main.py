@@ -30,6 +30,7 @@ class PaidOrderPayload(BaseModel):
     target_url: str
     quantity: int
     amount: float           # total paid amount
+    payment_type: str       # "test", "stripe", "razorpay"
 
 
 # ---------------------------
@@ -100,6 +101,10 @@ async def send_order_to_smm(api_key: str, service_id: int, link: str, quantity: 
 # ---------------------------
 @app.post("/webhook/payment-success")
 async def payment_success(payload: PaidOrderPayload):
+    # Validate payment type
+    if payload.payment_type not in ("test", "stripe", "razorpay"):
+        raise HTTPException(400, "Invalid payment type")
+
     # 1️⃣ Get or create customer
     customer_id = await get_or_create_customer(payload.email)
 
@@ -113,7 +118,8 @@ async def payment_success(payload: PaidOrderPayload):
         "target_url": payload.target_url,
         "quantity": payload.quantity,
         "amount": payload.amount,
-        "status": "paid"
+        "status": "paid",
+        "payment_type": payload.payment_type
     }
     r = await client.post(
         f"{SUPABASE_URL}/rest/v1/orders",
@@ -124,23 +130,23 @@ async def payment_success(payload: PaidOrderPayload):
         raise HTTPException(400, f"Order creation failed: {r.text}")
     order = r.json()[0]
 
-    # 4️⃣ Get API key from server
-    api_key = await get_server_api_key(service["server_id"])
+    # 4️⃣ If payment type is test, skip SMM panel
+    external_order_id = None
+    if payload.payment_type != "test":
+        api_key = await get_server_api_key(service["server_id"])
+        external_order_id = await send_order_to_smm(
+            api_key=api_key,
+            service_id=service["service_id"],  # integer ID for panel
+            link=payload.target_url,
+            quantity=payload.quantity
+        )
 
-    # 5️⃣ Send order to SMM panel
-    external_order_id = await send_order_to_smm(
-        api_key=api_key,
-        service_id=service["service_id"],  # integer ID for panel
-        link=payload.target_url,
-        quantity=payload.quantity
-    )
-
-    # 6️⃣ Update order with external order ID
-    await client.patch(
-        f"{SUPABASE_URL}/rest/v1/orders?id=eq.{order['id']}",
-        headers=SUPABASE_HEADERS,
-        json={"status": "processing", "external_order_id": external_order_id}
-    )
+        # 5️⃣ Update order with external order ID
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/orders?id=eq.{order['id']}",
+            headers=SUPABASE_HEADERS,
+            json={"status": "processing", "external_order_id": external_order_id}
+        )
 
     return {
         "success": True,
